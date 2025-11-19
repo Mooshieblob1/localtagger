@@ -1,59 +1,30 @@
-import torch
 from fastapi import FastAPI, UploadFile, File, HTTPException, Query
 from PIL import Image
 import io
-from clip_interrogator import Config, Interrogator
 import onnxruntime as ort
 from huggingface_hub import hf_hub_download
 import numpy as np
 import cv2
 import pandas as pd
 import requests
-import gc
+import re
 
 app = FastAPI(title="LAN Image Interrogator")
-
-# --- CONFIGURATION ---
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 # --- MODEL MANAGER ---
 
 class ModelManager:
     def __init__(self):
-        self.current_clip_model_name = None
-        self.ci_interrogator = None
         self.wd14_session = None
         self.wd14_tags = None
         self.wd14_tag_names = None
-
-    def unload_clip(self):
-        if self.ci_interrogator is not None:
-            print("Unloading CLIP model...")
-            del self.ci_interrogator
-            self.ci_interrogator = None
-            self.current_clip_model_name = None
-            gc.collect()
-            torch.cuda.empty_cache()
-
-    def load_clip(self, model_name: str):
-        if self.current_clip_model_name == model_name and self.ci_interrogator is not None:
-            return self.ci_interrogator
-
-        # Unload if different model is loaded
-        self.unload_clip()
-
-        print(f"Loading CLIP model: {model_name} on {DEVICE}...")
-        config = Config(clip_model_name=model_name, device=DEVICE)
-        self.ci_interrogator = Interrogator(config)
-        self.current_clip_model_name = model_name
-        return self.ci_interrogator
 
     def load_wd14(self):
         if self.wd14_session is not None:
             return self.wd14_session, self.wd14_tag_names
 
-        print("Loading WD14 Tagger...")
-        WD14_REPO = "SmilingWolf/wd-v1-4-moat-tagger-v2"
+        print("Loading WD14 Tagger (EVA02-Large)...")
+        WD14_REPO = "SmilingWolf/wd-eva02-large-tagger-v3"
         model_path = hf_hub_download(repo_id=WD14_REPO, filename="model.onnx")
         tags_path = hf_hub_download(repo_id=WD14_REPO, filename="selected_tags.csv")
 
@@ -89,78 +60,142 @@ def load_image_from_bytes(image_data: bytes) -> Image.Image:
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid image file: {str(e)}")
 
+def make_square(img, target_size):
+    old_size = img.shape[:2]
+    desired_size = max(old_size)
+    desired_size = max(desired_size, target_size)
+
+    delta_w = desired_size - old_size[1]
+    delta_h = desired_size - old_size[0]
+    top, bottom = delta_h // 2, delta_h - (delta_h // 2)
+    left, right = delta_w // 2, delta_w - (delta_w // 2)
+
+    color = [255, 255, 255]
+    return cv2.copyMakeBorder(img, top, bottom, left, right, cv2.BORDER_CONSTANT, value=color)
+
+def smart_resize(img, size):
+    # Assumes the image has already gone through make_square
+    if img.shape[0] > size:
+        img = cv2.resize(img, (size, size), interpolation=cv2.INTER_AREA)
+    elif img.shape[0] < size:
+        img = cv2.resize(img, (size, size), interpolation=cv2.INTER_CUBIC)
+    else:  # just do nothing
+        pass
+    return img
+
 def prepare_image_wd14(image: Image.Image, target_size=448):
-    if image.mode != 'RGB':
-        image = image.convert('RGB')
+    # Handle alpha channel: paste on white background
+    image = image.convert('RGBA')
+    new_image = Image.new('RGBA', image.size, 'WHITE')
+    new_image.paste(image, mask=image)
+    image = new_image.convert('RGB')
+    
+    # Convert to numpy array (RGB)
     img = np.array(image)
-    img = cv2.resize(img, (target_size, target_size), interpolation=cv2.INTER_CUBIC)
+    
+    # Convert RGB to BGR (OpenCV format) as expected by the reference code
+    img = img[:, :, ::-1]
+
+    # Preprocessing: make square and resize
+    img = make_square(img, target_size)
+    img = smart_resize(img, target_size)
+    
     img = img.astype(np.float32)
     img = np.expand_dims(img, 0)
     return img
 
-def run_wd14(image: Image.Image, threshold: float):
+RE_SPECIAL = re.compile(r'([\\()])')
+
+def run_wd14(image: Image.Image, threshold: float, use_spaces: bool = False, use_escape: bool = True, include_ranks: bool = False, score_descend: bool = True):
     session, tag_names = model_manager.load_wd14()
     
-    input_tensor = prepare_image_wd14(image)
+    # Get input size from model if possible, otherwise default to 448
+    try:
+        _, height, _, _ = session.get_inputs()[0].shape
+    except:
+        height = 448
+
+    input_tensor = prepare_image_wd14(image, target_size=height)
     input_name = session.get_inputs()[0].name
     probs = session.run(None, {input_name: input_tensor})[0][0]
     
     res_tags = {}
+    # Tags that are known to hallucinate due to color bleeding from clothing/backgrounds.
+    # Enforce a stricter minimum confidence for these regardless of the user-provided threshold.
+    high_hallucination_tags = {"blue_skin", "green_skin", "red_skin", "colored_skin", "pale_skin"}
     for i, p in enumerate(probs):
-        if p > threshold:
-            res_tags[tag_names[i]] = float(p)
-            
-    sorted_tags = dict(sorted(res_tags.items(), key=lambda item: item[1], reverse=True))
-    return {"tags": sorted_tags, "tag_string": ", ".join(sorted_tags.keys())}
+        tag_name = tag_names[i]
+        # normalize tag name for robust matching (lowercase, spaces -> underscores)
+        tag_norm = tag_name.lower().replace(" ", "_")
 
-def run_clip(model_name: str, image: Image.Image, mode: str):
-    interrogator = model_manager.load_clip(model_name)
-    if mode == "best":
-        return interrogator.interrogate(image)
+        if tag_norm in high_hallucination_tags:
+            # Enforce strict minimum confidence of 0.85 for these tags
+            if p >= 0.85:
+                res_tags[tag_name] = float(p)
+            # otherwise discard immediately (do not include)
+            continue
+
+        # Default behavior for other tags: use user-provided threshold
+        if p > threshold:
+            res_tags[tag_name] = float(p)
+            
+    # Formatting logic from reference code
+    text_items = []
+    tags_pairs = res_tags.items()
+    if score_descend:
+        tags_pairs = sorted(tags_pairs, key=lambda x: (-x[1], x[0]))
+    
+    for tag, score in tags_pairs:
+        tag_outformat = tag
+        if use_spaces:
+            tag_outformat = tag_outformat.replace('_', '-')
+        else:
+            tag_outformat = tag_outformat.replace(' ', ', ')
+            tag_outformat = tag_outformat.replace('_', ' ')
+        if use_escape:
+            tag_outformat = re.sub(RE_SPECIAL, r'\\\1', tag_outformat)
+        if include_ranks:
+            tag_outformat = f"({tag_outformat}:{score:.3f})"
+        text_items.append(tag_outformat)
+
+    if use_spaces:
+        output_text = ' '.join(text_items)
     else:
-        return interrogator.generate_caption(image)
+        output_text = ', '.join(text_items)
+
+    # Also return the raw tags dictionary (sorted)
+    sorted_tags = dict(sorted(res_tags.items(), key=lambda item: item[1], reverse=True))
+    
+    return {"tags": sorted_tags, "tag_string": output_text}
 
 # --- ENDPOINTS ---
 
-# VIT Endpoints
-@app.post("/interrogate/vit")
-async def interrogate_vit_post(file: UploadFile = File(...), mode: str = "fast"):
+# Main Interrogation Endpoints (EVA02-Large)
+@app.post("/interrogate")
+async def interrogate_post(
+    file: UploadFile = File(...), 
+    threshold: float = 0.35,
+    use_spaces: bool = False,
+    use_escape: bool = True,
+    include_ranks: bool = False,
+    score_descend: bool = True
+):
     image_data = await file.read()
     image = load_image_from_bytes(image_data)
-    caption = run_clip("ViT-L-14/openai", image, mode)
-    return {"caption": caption, "model": "ViT-L-14/openai"}
+    return run_wd14(image, threshold, use_spaces, use_escape, include_ranks, score_descend)
 
-@app.get("/interrogate/vit")
-async def interrogate_vit_get(url: str = Query(...), mode: str = "fast"):
+@app.get("/interrogate")
+async def interrogate_get(
+    url: str = Query(...), 
+    threshold: float = 0.35,
+    use_spaces: bool = False,
+    use_escape: bool = True,
+    include_ranks: bool = False,
+    score_descend: bool = True
+):
     image = download_image(url)
-    caption = run_clip("ViT-L-14/openai", image, mode)
-    return {"caption": caption, "model": "ViT-L-14/openai"}
+    return run_wd14(image, threshold, use_spaces, use_escape, include_ranks, score_descend)
 
-# EVA Endpoints
-@app.post("/interrogate/eva")
-async def interrogate_eva_post(file: UploadFile = File(...), mode: str = "fast"):
-    image_data = await file.read()
-    image = load_image_from_bytes(image_data)
-    caption = run_clip("ViT-g-14/laion2b_s12b_b42k", image, mode)
-    return {"caption": caption, "model": "ViT-g-14/laion2b_s12b_b42k"}
-
-@app.get("/interrogate/eva")
-async def interrogate_eva_get(url: str = Query(...), mode: str = "fast"):
-    image = download_image(url)
-    caption = run_clip("ViT-g-14/laion2b_s12b_b42k", image, mode)
-    return {"caption": caption, "model": "ViT-g-14/laion2b_s12b_b42k"}
-
-# PixAI (WD14) Endpoints
-@app.post("/interrogate/pixai")
-async def interrogate_pixai_post(file: UploadFile = File(...), threshold: float = 0.35):
-    image_data = await file.read()
-    image = load_image_from_bytes(image_data)
-    return run_wd14(image, threshold)
-
-@app.get("/interrogate/pixai")
-async def interrogate_pixai_get(url: str = Query(...), threshold: float = 0.35):
-    image = download_image(url)
-    return run_wd14(image, threshold)
 
 @app.get("/health")
 async def health_check():
