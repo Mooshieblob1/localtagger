@@ -211,6 +211,8 @@ async def interrogate_post(
     trigger_word: str = Query("", description="Optional trigger word to prepend to tags"),
     random_order: bool = Query(False, description="Randomize tag order (useful for training)")
 ):
+    print(f"Received POST request: files={len(file)}, threshold={threshold}, format={output_format}")
+    
     # If output is ZIP, we use a temporary file to avoid holding everything in RAM
     if output_format == "zip":
         # Create a temporary file that will be deleted after the response is sent
@@ -235,6 +237,8 @@ async def interrogate_post(
                     # Run inference on this batch
                     # Note: run_wd14 handles batching internally too, but here we call it with our small batch
                     results = run_wd14(batch_images, threshold, use_spaces, use_escape, include_ranks, score_descend, trigger_word, random_order)
+                    
+                    print(f"Batch processed. Found tags for {len(results)} images.")
                     
                     # Write to ZIP immediately and clear memory
                     for j, res in enumerate(results):
@@ -281,6 +285,10 @@ async def interrogate_post(
             batch_images.append(load_image_from_bytes(image_data))
             
         results = run_wd14(batch_images, threshold, use_spaces, use_escape, include_ranks, score_descend, trigger_word, random_order)
+        
+        for res in results:
+            print(f"Image processed. Tags found: {len(res['tags'])}")
+            
         all_results.extend(results)
         
         del batch_images
