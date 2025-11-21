@@ -40,40 +40,100 @@ The `k8s/` directory contains standard manifests.
 
 ## API Usage
 
-The service exposes endpoints for three models. You can upload an image file (`POST`) or provide an image URL (`GET`).
+The service exposes a unified endpoint for image interrogation using the **WD14 (EVA02-Large)** model.
 
-### 1. VIT (ViT-L-14/openai)
-Standard CLIP model. Good balance of speed and accuracy.
--   **POST (Upload):**
-    ```bash
-    curl -X POST -F "file=@image.jpg" "http://<SERVICE-IP>/interrogate/vit?mode=fast"
-    ```
--   **GET (URL):**
-    ```bash
-    curl "http://<SERVICE-IP>/interrogate/vit?url=https://example.com/image.jpg&mode=fast"
-    ```
+### Main Endpoint: `/interrogate`
 
-### 2. EVA (ViT-g-14/laion2b_s12b_b42k)
-High-performance CLIP model. **Note:** First request will take time to swap models (~30s).
--   **POST (Upload):**
-    ```bash
-    curl -X POST -F "file=@image.jpg" "http://<SERVICE-IP>/interrogate/eva?mode=best"
-    ```
--   **GET (URL):**
-    ```bash
-    curl "http://<SERVICE-IP>/interrogate/eva?url=https://example.com/image.jpg&mode=best"
-    ```
+Supports both single image and batch processing.
 
-### 3. PixAI (WD14 - Anime Tags)
-Specialized for anime/illustration tagging.
--   **POST (Upload):**
-    ```bash
-    curl -X POST -F "file=@image.jpg" "http://<SERVICE-IP>/interrogate/pixai?threshold=0.35"
-    ```
--   **GET (URL):**
-    ```bash
-    curl "http://<SERVICE-IP>/interrogate/pixai?url=https://example.com/image.jpg&threshold=0.35"
-    ```
+#### Parameters
+
+| Parameter | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `file` | File(s) | Required | Image file(s) to process. Send multiple for batching. |
+| `output_format` | string | `"json"` | `"zip"` for dataset download, `"json"` for API response. |
+| `threshold` | float | `0.35` | Confidence threshold (0.0 - 1.0). |
+| `trigger_word` | string | `""` | Optional word to prepend to tags (e.g., `sks_person`). |
+| `random_order` | boolean | `false` | Shuffle tags (recommended for LoRA training). |
+| `use_spaces` | boolean | `false` | Use spaces instead of underscores in tags. |
+| `use_escape` | boolean | `true` | Escape special characters (parentheses). |
+
+---
+
+## Frontend Integration Guide
+
+### 1. Response Structure (JSON)
+
+When `output_format="json"` (default), the API returns an **Array of Objects**.
+
+```json
+[
+  {
+    "tags": {
+      "general": 0.99,
+      "cat": 0.97,
+      "animal": 0.82
+    },
+    "tag_string": "general, cat, animal"
+  }
+]
+```
+
+**Key Fields:**
+*   **`tags`**: Object with tag names as keys and confidence scores (0.0-1.0) as values.
+*   **`tag_string`**: Comma-separated string of tags, ready for display or text files.
+
+### 2. Batch Processing (Multiple Images)
+
+To process multiple images, append them to the same form field name `file`.
+
+**JavaScript Example:**
+```javascript
+const formData = new FormData();
+files.forEach((file) => {
+  formData.append("file", file); // Must be "file" for all images
+});
+
+// Add query parameters
+const params = new URLSearchParams({
+  threshold: "0.35",
+  random_order: "true"
+});
+
+await fetch(`http://localhost:8000/interrogate?${params}`, {
+  method: "POST",
+  body: formData
+});
+```
+
+### 3. Downloading Datasets (ZIP)
+
+To generate a dataset for LoRA training, set `output_format="zip"`. The response will be a binary blob.
+
+**JavaScript Example:**
+```javascript
+const params = new URLSearchParams({
+  output_format: "zip",
+  trigger_word: "my_trigger",
+  random_order: "true"
+});
+
+const response = await fetch(`http://localhost:8000/interrogate?${params}`, {
+  method: "POST",
+  body: formData
+});
+
+if (response.ok) {
+  const blob = await response.blob();
+  const url = window.URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = "dataset.zip";
+  document.body.appendChild(a);
+  a.click();
+  window.URL.revokeObjectURL(url);
+}
+```
 
 ---
 
