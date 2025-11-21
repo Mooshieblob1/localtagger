@@ -5,3 +5,4 @@ venv/
 *.zip
 *.log
 .DS_Store
+server.log

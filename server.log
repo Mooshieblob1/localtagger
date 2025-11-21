@@ -1,6 +1,11 @@
-INFO:     Started server process [29822]
+INFO:     Started server process [73072]
 INFO:     Waiting for application startup.
 INFO:     Application startup complete.
-ERROR:    [Errno 98] error while attempting to bind on address ('0.0.0.0', 8000): [errno 98] address already in use
+INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
+Loading WD14 Tagger (EVA02-Large)...
+Warning: CUDAExecutionProvider not found for ONNX Runtime. Fallback to CPU.
+INFO:     127.0.0.1:36750 - "POST /interrogate?output_format=zip&trigger_word=my_trigger&random_order=true HTTP/1.1" 200 OK
+INFO:     Shutting down
 INFO:     Waiting for application shutdown.
 INFO:     Application shutdown complete.
+INFO:     Finished server process [73072]
